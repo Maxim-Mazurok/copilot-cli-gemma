@@ -18,30 +18,45 @@ npm start -- "Inspect this repo and tell me how to run it"
 ## Defaults
 
 - Verbose assistant output is on.
-- Thinking/reasoning mode is on.
+- Thinking/tool-turn display is opt-in with `AGENT_THINKING=1`.
 - Tool calls and tool results are printed.
 - Raw assistant stream deltas are hidden by default because local tool-call markup is noisy.
-- RTK is exposed as the preferred compact command tool.
+- RTK is exposed for compact supported commands, not as a general shell.
+- vMLX/Gemma sampling stability params are injected by default.
+- Tool-call limiting is off by default. Set `AGENT_MAX_TOOL_CALLS` only if you want a guardrail.
 - Destructive shell patterns are blocked unless `ALLOW_UNSAFE_COMMANDS=1`.
 
 ## Useful Env
 
 ```bash
-AGENT_THINKING=0          # disable reasoning request
+AGENT_THINKING=0          # hide thinking/tool-turn text
+AGENT_THINKING=1          # show SDK reasoning/tool-turn text when present
+AGENT_NATIVE_THINKING=1   # also request provider reasoning effort (experimental)
+AGENT_REASONING_EFFORT=high # explicit provider reasoning effort
 AGENT_SHOW_OUTPUT=0       # quiet final-answer mode
 AGENT_SHOW_THINKING=0     # hide reasoning events/text
+AGENT_SHOW_TOOL_TEXT=0    # hide assistant text attached to tool-call turns
 AGENT_SHOW_RAW_DELTAS=1   # show raw streamed assistant/tool markup
 AGENT_SHOW_EVENTS=1       # useful event summary
 AGENT_SHOW_EVENTS=raw     # full SDK event stream
+AGENT_SHOW_EVENT_DATA=1   # include event JSON with shown events
 AGENT_LOG_STREAM=stderr   # send verbose log stream to stderr
+AGENT_INJECT_SAMPLING=0   # disable OpenAI chat-completion sampling injection
+AGENT_TEMPERATURE=0.1
+AGENT_REPETITION_PENALTY=1.08
+AGENT_FREQUENCY_PENALTY=0.25
+AGENT_PRESENCE_PENALTY=0.05
+AGENT_PARALLEL_TOOL_CALLS=1 # allow provider parallel tool calls; default false
 TOOL_FALLBACK_MS=0        # default: disabled, wait for idle/overall timeout
+AGENT_MAX_TOOL_CALLS=40   # optional guardrail; unset means no tool-call cap
+AGENT_SINGLE_TOOL_TURNS=1 # reject extra same-turn tool calls; no total-call cap
 AGENT_TIMEOUT_MS=300000   # whole-run timeout
 AGENT_STOP_TIMEOUT_MS=3000 # force exit if SDK shutdown hangs
 ```
 
 ## RTK Usage
 
-The agent prompt is intentionally tiny. RTK is the compact command path:
+The agent prompt is intentionally tiny. RTK is the compact path for supported commands:
 
 ```text
 rtk command: read -l aggressive index.js
@@ -50,3 +65,35 @@ rtk command: ls
 ```
 
 RTK handles output reduction. The agent code does not manually strip command output.
+
+## Debug Proxy
+
+```bash
+npm run proxy
+COPILOT_PROVIDER_BASE_URL=http://localhost:8999/v1 npm start -- "your prompt"
+```
+
+The proxy logs provider request JSON and raw streamed response chunks. It also injects the same sampling params by default.
+
+Useful proxy flags:
+
+```bash
+PROXY_LOG_FILE=debug-proxy.log node debug-proxy.js
+PROXY_INJECT_SAMPLING=0 node debug-proxy.js
+PROXY_FORCE_PARALLEL_TOOLS_FALSE=1 node debug-proxy.js
+```
+
+Sampling defaults:
+
+```json
+{
+  "temperature": 0.1,
+  "repetition_penalty": 1.08,
+  "frequency_penalty": 0.25,
+  "presence_penalty": 0.05
+}
+```
+
+`PROXY_FORCE_PARALLEL_TOOLS_FALSE=1` injects `parallel_tool_calls:false` into chat-completion requests so you can test whether the local provider honors single-tool turns.
+
+For this vMLX/Gemma setup, the proxy showed that `parallel_tool_calls:false` is present in the request but vMLX still returns multiple parsed tool calls. Use `AGENT_SINGLE_TOOL_TURNS=1` if you want the harness to force observe-before-next-tool behavior without capping total tool calls.
