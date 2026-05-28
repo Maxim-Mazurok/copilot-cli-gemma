@@ -11,11 +11,22 @@ const forceParallelToolCallsFalse = ["1", "true", "yes", "on"].includes(
 const injectSamplingParams = !["0", "false", "no", "off"].includes(
   String(process.env.PROXY_INJECT_SAMPLING ?? "1").toLowerCase(),
 );
+const thinkingEnabled = envBool(false, "AGENT_THINKING", "PROXY_THINKING");
+const nativeThinkingEnabled =
+  thinkingEnabled ||
+  envBool(false, "AGENT_NATIVE_THINKING", "AGENT_REQUEST_NATIVE_THINKING", "PROXY_NATIVE_THINKING", "COPILOT_THINKING");
+const reasoningEffort =
+  process.env.AGENT_REASONING_EFFORT ||
+  process.env.COPILOT_REASONING_EFFORT ||
+  process.env.PROXY_REASONING_EFFORT;
+const defaultRepetitionPenalty = nativeThinkingEnabled ? 1.12 : 1.08;
+const defaultFrequencyPenalty = nativeThinkingEnabled ? 0.35 : 0.25;
+const defaultPresencePenalty = nativeThinkingEnabled ? 0.08 : 0.05;
 const samplingParams = {
   temperature: envNumber(0.1, "PROXY_TEMPERATURE", "AGENT_TEMPERATURE", "COPILOT_TEMPERATURE"),
-  repetition_penalty: envNumber(1.08, "PROXY_REPETITION_PENALTY", "AGENT_REPETITION_PENALTY", "COPILOT_REPETITION_PENALTY"),
-  frequency_penalty: envNumber(0.25, "PROXY_FREQUENCY_PENALTY", "AGENT_FREQUENCY_PENALTY", "COPILOT_FREQUENCY_PENALTY"),
-  presence_penalty: envNumber(0.05, "PROXY_PRESENCE_PENALTY", "AGENT_PRESENCE_PENALTY", "COPILOT_PRESENCE_PENALTY"),
+  repetition_penalty: envNumber(defaultRepetitionPenalty, "PROXY_REPETITION_PENALTY", "AGENT_REPETITION_PENALTY", "COPILOT_REPETITION_PENALTY"),
+  frequency_penalty: envNumber(defaultFrequencyPenalty, "PROXY_FREQUENCY_PENALTY", "AGENT_FREQUENCY_PENALTY", "COPILOT_FREQUENCY_PENALTY"),
+  presence_penalty: envNumber(defaultPresencePenalty, "PROXY_PRESENCE_PENALTY", "AGENT_PRESENCE_PENALTY", "COPILOT_PRESENCE_PENALTY"),
 };
 let requestSeq = 0;
 
@@ -29,6 +40,16 @@ function envNumber(defaultValue, ...names) {
     if (value === undefined || value === "") continue;
     const parsed = Number(value);
     if (!Number.isNaN(parsed)) return parsed;
+  }
+  return defaultValue;
+}
+
+function envBool(defaultValue, ...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value === undefined) continue;
+    if (["1", "true", "yes", "on"].includes(value.toLowerCase())) return true;
+    if (["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
   }
   return defaultValue;
 }
@@ -58,6 +79,10 @@ function outboundBodyFor(pathname, body) {
     if (!parsed || typeof parsed !== "object") return body;
     if (injectSamplingParams) {
       Object.assign(parsed, samplingParams);
+    }
+    if (nativeThinkingEnabled) {
+      parsed.enable_thinking = true;
+      if (reasoningEffort) parsed.reasoning_effort = reasoningEffort;
     }
     if (forceParallelToolCallsFalse && Array.isArray(parsed.tools) && parsed.tools.length > 0) {
       parsed.parallel_tool_calls = false;

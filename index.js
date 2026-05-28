@@ -27,7 +27,9 @@ const eventMode = String(process.env.AGENT_SHOW_EVENTS || process.env.AGENT_DEBU
 const showEvents = ["1", "true", "yes", "on", "raw", "all", "verbose"].includes(eventMode);
 const showRawEvents = ["raw", "all", "verbose"].includes(eventMode);
 const thinkingEnabled = envBool(false, "AGENT_THINKING", "AGENT_ENABLE_THINKING");
-const nativeThinkingEnabled = envBool(false, "AGENT_NATIVE_THINKING", "AGENT_REQUEST_NATIVE_THINKING", "COPILOT_THINKING");
+const nativeThinkingEnabled =
+  thinkingEnabled ||
+  envBool(false, "AGENT_NATIVE_THINKING", "AGENT_REQUEST_NATIVE_THINKING", "COPILOT_THINKING");
 const toolFallbackMs = Number(process.env.TOOL_FALLBACK_MS || 0);
 const singleToolTurns = envBool(false, "AGENT_SINGLE_TOOL_TURNS", "AGENT_SEQUENTIAL_TOOLS");
 const injectSamplingParams = envBool(true, "AGENT_INJECT_SAMPLING", "AGENT_VMLX_SAMPLING");
@@ -35,23 +37,27 @@ const parallelToolCalls = envBool(false, "AGENT_PARALLEL_TOOL_CALLS", "COPILOT_P
 const showAgentOutput = envBool(true, "AGENT_SHOW_OUTPUT", "SHOW_AGENT_OUTPUT");
 const showThinking = envBool(false, "AGENT_SHOW_THINKING", "SHOW_THINKING") || thinkingEnabled;
 const showRawAssistantDeltas = envBool(false, "AGENT_SHOW_RAW_DELTAS", "SHOW_RAW_DELTAS");
-const showToolMessageText = envBool(true, "AGENT_SHOW_TOOL_TEXT", "SHOW_TOOL_TEXT");
+const showToolMessageText = envBool(false, "AGENT_SHOW_TOOL_TEXT", "SHOW_TOOL_TEXT");
+const teeProviderReasoning =
+  showThinking && envBool(true, "AGENT_TEE_PROVIDER_REASONING", "AGENT_SHOW_PROVIDER_REASONING");
 const showEventData = envBool(false, "AGENT_SHOW_EVENT_DATA", "AGENT_DEBUG_EVENT_DATA");
 const logStream = process.env.AGENT_LOG_STREAM === "stderr" ? process.stderr : process.stdout;
 const forceReasoningCapability = flag("AGENT_FORCE_REASONING_CAPABILITY");
 const reasoningEffort =
   process.env.AGENT_REASONING_EFFORT ||
-  process.env.COPILOT_REASONING_EFFORT ||
-  (nativeThinkingEnabled ? "high" : undefined);
+  process.env.COPILOT_REASONING_EFFORT;
 const reasoningSummary =
   process.env.AGENT_REASONING_SUMMARY ||
   process.env.COPILOT_REASONING_SUMMARY;
 const streaming = showAgentOutput || showThinking;
+const defaultRepetitionPenalty = nativeThinkingEnabled ? 1.2 : 1.08;
+const defaultFrequencyPenalty = nativeThinkingEnabled ? 0.35 : 0.25;
+const defaultPresencePenalty = nativeThinkingEnabled ? 0.08 : 0.05;
 const samplingParams = {
   temperature: envNumber(0.1, "AGENT_TEMPERATURE", "COPILOT_TEMPERATURE"),
-  repetition_penalty: envNumber(1.08, "AGENT_REPETITION_PENALTY", "COPILOT_REPETITION_PENALTY"),
-  frequency_penalty: envNumber(0.25, "AGENT_FREQUENCY_PENALTY", "COPILOT_FREQUENCY_PENALTY"),
-  presence_penalty: envNumber(0.05, "AGENT_PRESENCE_PENALTY", "COPILOT_PRESENCE_PENALTY"),
+  repetition_penalty: envNumber(defaultRepetitionPenalty, "AGENT_REPETITION_PENALTY", "COPILOT_REPETITION_PENALTY"),
+  frequency_penalty: envNumber(defaultFrequencyPenalty, "AGENT_FREQUENCY_PENALTY", "COPILOT_FREQUENCY_PENALTY"),
+  presence_penalty: envNumber(defaultPresencePenalty, "AGENT_PRESENCE_PENALTY", "COPILOT_PRESENCE_PENALTY"),
 };
 let providerProxyServer;
 
@@ -60,6 +66,8 @@ const eventCounts = new Map();
 const toolTurnById = new Map();
 const approvedToolByTurn = new Map();
 let totalToolCalls = 0;
+let activeOutputState;
+let providerReasoningPrinted = false;
 
 const blockedCommandPatterns = [
   /\brm\s+.*-[^\s]*r/i,
@@ -106,6 +114,10 @@ function providerBodyFor(pathname, body) {
     const data = JSON.parse(body.toString("utf8"));
     if (!data || typeof data !== "object") return body;
     if (injectSamplingParams) Object.assign(data, samplingParams);
+    if (nativeThinkingEnabled) {
+      data.enable_thinking = true;
+      if (reasoningEffort) data.reasoning_effort = reasoningEffort;
+    }
     if (!parallelToolCalls && Array.isArray(data.tools) && data.tools.length > 0) {
       data.parallel_tool_calls = false;
     }
@@ -117,7 +129,7 @@ function providerBodyFor(pathname, body) {
 
 async function startProviderProxyIfNeeded() {
   if (providerType !== "openai") return;
-  if (!injectSamplingParams && parallelToolCalls) return;
+  if (!injectSamplingParams && parallelToolCalls && !nativeThinkingEnabled && !teeProviderReasoning) return;
 
   const upstream = new URL(baseUrl);
   const server = http.createServer((clientReq, clientRes) => {
@@ -144,7 +156,19 @@ async function startProviderProxyIfNeeded() {
         },
         (upstreamRes) => {
           clientRes.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-          upstreamRes.pipe(clientRes);
+          const reasoningTee =
+            teeProviderReasoning && target.pathname.endsWith("/chat/completions")
+              ? createProviderReasoningTee()
+              : undefined;
+
+          upstreamRes.on("data", (chunk) => {
+            reasoningTee?.feed(chunk);
+            clientRes.write(chunk);
+          });
+          upstreamRes.on("end", () => {
+            reasoningTee?.finish();
+            clientRes.end();
+          });
         },
       );
 
@@ -176,6 +200,71 @@ async function stopProviderProxy() {
   if (!providerProxyServer) return;
   await new Promise((resolve) => providerProxyServer.close(resolve));
   providerProxyServer = undefined;
+}
+
+function createProviderReasoningTee() {
+  let sseBuffer = "";
+  let fullResponse = "";
+
+  const handlePayload = (payload) => {
+    for (const text of extractReasoningFields(payload)) {
+      printProviderReasoning(text);
+    }
+  };
+
+  const handleSseBlock = (block) => {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") return;
+
+    try {
+      handlePayload(JSON.parse(data));
+    } catch {
+      // Ignore non-JSON SSE comments/diagnostics.
+    }
+  };
+
+  return {
+    feed(chunk) {
+      const text = chunk.toString("utf8");
+      fullResponse += text;
+      sseBuffer += text;
+
+      while (true) {
+        const match = sseBuffer.match(/\r?\n\r?\n/);
+        if (!match) break;
+        const block = sseBuffer.slice(0, match.index);
+        sseBuffer = sseBuffer.slice((match.index || 0) + match[0].length);
+        handleSseBlock(block);
+      }
+    },
+    finish() {
+      const trimmed = fullResponse.trim();
+      if (!trimmed.startsWith("{")) return;
+      try {
+        handlePayload(JSON.parse(trimmed));
+      } catch {
+        // Streaming responses are not valid JSON as a whole.
+      }
+    },
+  };
+}
+
+function* extractReasoningFields(payload) {
+  for (const choice of payload?.choices || []) {
+    const containers = [choice.delta, choice.message].filter(Boolean);
+    for (const container of containers) {
+      for (const key of ["reasoning_content", "reasoning", "thinking"]) {
+        if (typeof container[key] === "string" && container[key].length > 0) {
+          yield container[key];
+        }
+      }
+    }
+  }
 }
 
 function trimOutput(value, maxLength = 20_000) {
@@ -651,6 +740,23 @@ function writeLog(text) {
   logStream.write(text);
 }
 
+function closeThinkingBlock(state = activeOutputState) {
+  if (state?.heading !== "thinking") return;
+  writeLog("\n[/thinking]\n");
+  state.heading = "";
+}
+
+function printProviderReasoning(text) {
+  if (!showThinking || !text) return;
+  providerReasoningPrinted = true;
+  if (activeOutputState) {
+    maybePrintHeading(activeOutputState, "thinking");
+  } else {
+    writeLog("\n[thinking]\n");
+  }
+  writeLog(text);
+}
+
 function oneLine(value, maxLength = 500) {
   const text = String(value ?? "")
     .replace(/\r/g, "\\r")
@@ -708,7 +814,7 @@ function normalizeVisibleThought(text) {
 
 function maybePrintHeading(state, heading) {
   if (state.heading === heading) return;
-  if (state.heading === "thinking") writeLog("\n[/thinking]\n");
+  if (state.heading === "thinking") closeThinkingBlock(state);
   state.heading = heading;
   writeLog(`\n[${heading}]\n`);
 }
@@ -759,11 +865,13 @@ function printToolResult(event) {
   const summary = summarizeToolResult(result);
   if (!summary) return;
 
+  closeThinkingBlock();
   const status = event.data.success ? "ok" : "failed";
   writeLog(`[tool result] ${status}: ${summary}\n`);
 }
 
 function printToolStart(event) {
+  closeThinkingBlock();
   writeLog(`[tool] ${event.data.toolName}: ${summarizeToolArgs(event.data.toolName, event.data.arguments)}\n`);
 }
 
@@ -826,6 +934,8 @@ const compactSystemPrompt = [
   "- Stay in cwd unless user asks or task truly needs outside.",
   "- Use rtk when command is supported and output may be noisy/large. Use bash for normal shell/OS facts/unsupported commands.",
   "- Use tools to inspect current facts, files, commands, and external state before claiming them.",
+  "- <current_datetime> is hint only. Current/local fact still needs tool evidence.",
+  "- Need tool -> emit one tool call only, no prose. Wait result, then decide next.",
   "- Prefer compact commands and compact outputs.",
   "- If a later action depends on a tool result, wait for that result before doing it.",
   "- Do not chain dependent decisions with && or ||. Run one step, read result, then decide.",
@@ -920,6 +1030,7 @@ try {
     reasoningDeltaIds: new Set(),
     toolTextMessageIds: new Set(),
   };
+  activeOutputState = outputState;
 
   session.on(logEvent);
 
@@ -934,6 +1045,7 @@ try {
 
   session.on("assistant.reasoning_delta", (event) => {
     if (!showThinking) return;
+    if (teeProviderReasoning && providerReasoningPrinted) return;
     outputState.reasoningDeltaIds.add(event.data.reasoningId);
     maybePrintHeading(outputState, "thinking");
     writeLog(event.data.deltaContent);
@@ -941,6 +1053,7 @@ try {
 
   session.on("assistant.reasoning", (event) => {
     if (!showThinking || outputState.reasoningDeltaIds.has(event.data.reasoningId)) return;
+    if (teeProviderReasoning && providerReasoningPrinted) return;
     maybePrintHeading(outputState, "thinking");
     writeLog(event.data.content);
   });
@@ -999,15 +1112,15 @@ try {
       const content = event.data.content?.trim();
       if (event.data.toolRequests?.length) {
         const visible = normalizeVisibleThought(content);
-        if (showThinking && showToolMessageText && visible && !outputState.toolTextMessageIds.has(event.data.messageId)) {
+        if (showToolMessageText && visible && !outputState.toolTextMessageIds.has(event.data.messageId)) {
           outputState.toolTextMessageIds.add(event.data.messageId);
-          maybePrintHeading(outputState, "thinking");
+          maybePrintHeading(outputState, "assistant tool text");
           writeLog(`${visible}\n`);
         }
         return;
       }
 
-      if (showThinking && event.data.reasoningText) {
+      if (showThinking && event.data.reasoningText && !(teeProviderReasoning && providerReasoningPrinted)) {
         maybePrintHeading(outputState, "thinking");
         writeLog(event.data.reasoningText);
       }
@@ -1040,7 +1153,8 @@ try {
   });
 
   await session.abort().catch(() => {});
-  if (outputState.heading === "thinking") writeLog("\n[/thinking]\n");
+  closeThinkingBlock(outputState);
+  activeOutputState = undefined;
   printSuppressionSummary();
   if (showAgentOutput && outputState.finalAnswerPrinted) {
     writeLog("\n");
@@ -1052,6 +1166,8 @@ try {
   console.error(`[agent error] ${error.message}`);
   process.exitCode = 1;
 } finally {
+  closeThinkingBlock();
+  activeOutputState = undefined;
   if (failed) process.exit(process.exitCode || 1);
   let stopped = false;
   await Promise.race([
