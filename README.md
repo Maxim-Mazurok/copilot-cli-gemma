@@ -12,7 +12,7 @@ export COPILOT_OFFLINE=true
 export COPILOT_PROVIDER_MAX_PROMPT_TOKENS=12000
 export COPILOT_PROVIDER_MAX_OUTPUT_TOKENS=1024
 
-npm start -- "Check what time is it, if it is past 4pm - check if google.com accessible, otherwise check if x.com is accessible. at the end write executive report about what you found out into report.md file"
+npm start -- "Inspect this repo and tell me how to run it"
 ```
 
 ## Defaults
@@ -20,8 +20,9 @@ npm start -- "Check what time is it, if it is past 4pm - check if google.com acc
 - Verbose assistant output is on.
 - Thinking/reasoning mode is on.
 - Tool calls and tool results are printed.
+- Raw assistant stream deltas are hidden by default because local tool-call markup is noisy.
 - RTK is exposed as the preferred compact command tool.
-- Raw `curl`/`wget` through `bash` is blocked; use `rtk` for web checks.
+- Destructive shell patterns are blocked unless `ALLOW_UNSAFE_COMMANDS=1`.
 
 ## Useful Env
 
@@ -29,20 +30,23 @@ npm start -- "Check what time is it, if it is past 4pm - check if google.com acc
 AGENT_THINKING=0          # disable reasoning request
 AGENT_SHOW_OUTPUT=0       # quiet final-answer mode
 AGENT_SHOW_THINKING=0     # hide reasoning events/text
+AGENT_SHOW_RAW_DELTAS=1   # show raw streamed assistant/tool markup
 AGENT_SHOW_EVENTS=1       # useful event summary
 AGENT_SHOW_EVENTS=raw     # full SDK event stream
+AGENT_LOG_STREAM=stderr   # send verbose log stream to stderr
 TOOL_FALLBACK_MS=0        # default: disabled, wait for idle/overall timeout
 AGENT_TIMEOUT_MS=300000   # whole-run timeout
 AGENT_STOP_TIMEOUT_MS=3000 # force exit if SDK shutdown hangs
 ```
 
-## RTK Pattern
+## RTK Usage
 
-The agent prompt is intentionally tiny. For compact output it should use `rtk` first:
+The agent prompt is intentionally tiny. RTK is the compact command path:
 
 ```text
-rtk command: curl -sS -o /dev/null -w 'http_code=%{http_code}\n' --max-time 5 https://www.google.com
 rtk command: read -l aggressive index.js
+rtk command: grep "defineTool" index.js
+rtk command: ls
 ```
 
-RTK handles output reduction. The agent code does not manually strip cookies or headers from RTK output.
+RTK handles output reduction. The agent code does not manually strip command output.
