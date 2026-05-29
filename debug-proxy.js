@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { inspect } from "node:util";
 
-const upstream = new URL(process.env.PROXY_UPSTREAM || "http://localhost:8000");
+const upstream = new URL(process.env.PROXY_UPSTREAM || "http://127.0.0.1:8001");
 const port = Number(process.env.PROXY_PORT || 8999);
 const logFile = process.env.PROXY_LOG_FILE;
 const forceParallelToolCallsFalse = ["1", "true", "yes", "on"].includes(
@@ -19,7 +19,7 @@ const reasoningEffort =
   process.env.AGENT_REASONING_EFFORT ||
   process.env.COPILOT_REASONING_EFFORT ||
   process.env.PROXY_REASONING_EFFORT;
-const defaultRepetitionPenalty = nativeThinkingEnabled ? 1.12 : 1.08;
+const defaultRepetitionPenalty = nativeThinkingEnabled ? 1.2 : 1.08;
 const defaultFrequencyPenalty = nativeThinkingEnabled ? 0.35 : 0.25;
 const defaultPresencePenalty = nativeThinkingEnabled ? 0.08 : 0.05;
 const samplingParams = {

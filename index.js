@@ -10,9 +10,9 @@ const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const cwd = process.cwd();
-const model = process.env.COPILOT_MODEL ?? "gemma";
+const model = process.env.COPILOT_MODEL ?? "gemma-4-26b-a4b-it-4bit";
 const providerType = process.env.COPILOT_PROVIDER_TYPE ?? "openai";
-let baseUrl = process.env.COPILOT_PROVIDER_BASE_URL ?? "http://localhost:8000/v1";
+let baseUrl = process.env.COPILOT_PROVIDER_BASE_URL ?? "http://127.0.0.1:8001/v1";
 const maxPromptTokens = Number(process.env.COPILOT_PROVIDER_MAX_PROMPT_TOKENS || 12000);
 const maxOutputTokens = Number(process.env.COPILOT_PROVIDER_MAX_OUTPUT_TOKENS || 1024);
 const agentTimeoutMs = Number(process.env.AGENT_TIMEOUT_MS || 300_000);
@@ -26,7 +26,7 @@ const allowOutsideCwd = process.env.ALLOW_OUTSIDE_CWD === "1";
 const eventMode = String(process.env.AGENT_SHOW_EVENTS || process.env.AGENT_DEBUG_EVENTS || "").toLowerCase();
 const showEvents = ["1", "true", "yes", "on", "raw", "all", "verbose"].includes(eventMode);
 const showRawEvents = ["raw", "all", "verbose"].includes(eventMode);
-const thinkingEnabled = envBool(false, "AGENT_THINKING", "AGENT_ENABLE_THINKING");
+const thinkingEnabled = envBool(true, "AGENT_THINKING", "AGENT_ENABLE_THINKING");
 const nativeThinkingEnabled =
   thinkingEnabled ||
   envBool(false, "AGENT_NATIVE_THINKING", "AGENT_REQUEST_NATIVE_THINKING", "COPILOT_THINKING");
@@ -49,7 +49,13 @@ const reasoningEffort =
 const reasoningSummary =
   process.env.AGENT_REASONING_SUMMARY ||
   process.env.COPILOT_REASONING_SUMMARY;
-const streaming = showAgentOutput || showThinking;
+const streaming = envBool(showAgentOutput || showThinking, "AGENT_STREAMING", "COPILOT_STREAMING");
+const providerSingleFlight = envBool(true, "AGENT_PROVIDER_SINGLE_FLIGHT");
+const providerPreemptiveStream = envBool(true, "AGENT_PROVIDER_PREEMPTIVE_STREAM");
+const providerTimeoutMs = Number(process.env.AGENT_PROVIDER_TIMEOUT_MS || 600_000);
+const providerHeartbeatMs = Number(process.env.AGENT_PROVIDER_HEARTBEAT_MS || 5_000);
+const providerDebug = envBool(false, "AGENT_PROVIDER_DEBUG", "AGENT_DEBUG_PROVIDER");
+const providerTraceSse = envBool(false, "AGENT_PROVIDER_TRACE_SSE");
 const defaultRepetitionPenalty = nativeThinkingEnabled ? 1.2 : 1.08;
 const defaultFrequencyPenalty = nativeThinkingEnabled ? 0.35 : 0.25;
 const defaultPresencePenalty = nativeThinkingEnabled ? 0.08 : 0.05;
@@ -60,6 +66,9 @@ const samplingParams = {
   presence_penalty: envNumber(defaultPresencePenalty, "AGENT_PRESENCE_PENALTY", "COPILOT_PRESENCE_PENALTY"),
 };
 let providerProxyServer;
+let providerGate = Promise.resolve();
+let providerRequestSeq = 0;
+let providerSseTraceCount = 0;
 
 const toolHistory = [];
 const eventCounts = new Map();
@@ -127,14 +136,312 @@ function providerBodyFor(pathname, body) {
   }
 }
 
+function parseJsonBuffer(body) {
+  try {
+    return JSON.parse(body.toString("utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+function isChatCompletionPath(pathname) {
+  return pathname.endsWith("/chat/completions");
+}
+
+function bodyRequestsStream(body) {
+  return parseJsonBuffer(body)?.stream === true;
+}
+
+function providerLog(message) {
+  if (providerDebug || showRawEvents) writeLog(`[provider] ${message}\n`);
+}
+
+async function runProviderSingleFlight(run) {
+  const previous = providerGate.catch(() => {});
+  let release = () => {};
+  providerGate = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  await previous;
+  try {
+    return await run();
+  } finally {
+    release();
+  }
+}
+
+function writeSseComment(clientRes, text) {
+  if (clientRes.destroyed || clientRes.writableEnded) return;
+  clientRes.write(`: ${text}\n\n`);
+}
+
+function writeSseData(clientRes, payload) {
+  if (clientRes.destroyed || clientRes.writableEnded) return;
+  const text = `data: ${JSON.stringify(payload)}\n\n`;
+  traceProviderSse(text);
+  clientRes.write(text);
+}
+
+function traceProviderSse(text) {
+  if (!providerTraceSse || providerSseTraceCount >= 40) return;
+  providerSseTraceCount += 1;
+  writeLog(`[provider sse] ${oneLine(text, 1200)}\n`);
+}
+
+function writeSseKeepalive(clientRes, streamId) {
+  writeSseData(clientRes, {
+    id: streamId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: { content: "" },
+        finish_reason: null,
+      },
+    ],
+  });
+}
+
+function normalizeOpenAiStreamPayload(payload, streamId) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.choices)) return payload;
+  if (streamId) payload.id = streamId;
+  if (payload.model === "keepalive") payload.model = model;
+  for (const choice of payload.choices) {
+    if (choice && typeof choice === "object" && !Object.hasOwn(choice, "finish_reason")) {
+      choice.finish_reason = null;
+    }
+  }
+  return payload;
+}
+
+function createSseNormalizer(writeBlock, streamId) {
+  let buffer = "";
+
+  const normalizeBlock = (block) => {
+    const lines = block.split(/\r?\n/);
+    const dataLines = lines.filter((line) => line.startsWith("data:"));
+    if (dataLines.length === 0) return block ? `${block}\n\n` : "";
+
+    const data = dataLines
+      .map((line) => line.slice(5).trimStart())
+      .join("\n")
+      .trim();
+    if (!data || data === "[DONE]") return `data: ${data || ""}\n\n`;
+
+    try {
+      const text = `data: ${JSON.stringify(normalizeOpenAiStreamPayload(JSON.parse(data), streamId))}\n\n`;
+      traceProviderSse(text);
+      return text;
+    } catch {
+      const text = `${block}\n\n`;
+      traceProviderSse(text);
+      return text;
+    }
+  };
+
+  return {
+    feed(chunk) {
+      buffer += chunk.toString("utf8");
+      while (true) {
+        const match = buffer.match(/\r?\n\r?\n/);
+        if (!match) break;
+        const block = buffer.slice(0, match.index);
+        buffer = buffer.slice((match.index || 0) + match[0].length);
+        const normalized = normalizeBlock(block);
+        if (normalized) writeBlock(normalized);
+      }
+    },
+    finish() {
+      const leftover = buffer.trim();
+      buffer = "";
+      if (leftover) writeBlock(normalizeBlock(leftover));
+    },
+  };
+}
+
+function sendProxyError(clientRes, error, statusCode = 502) {
+  if (clientRes.destroyed || clientRes.writableEnded) return;
+
+  const message = error instanceof Error ? error.message : String(error);
+  if (clientRes.headersSent) {
+    clientRes.write(`data: ${JSON.stringify({ error: { message } })}\n\n`);
+    clientRes.write("data: [DONE]\n\n");
+    clientRes.end();
+    return;
+  }
+
+  clientRes.writeHead(statusCode, { "content-type": "application/json" });
+  clientRes.end(JSON.stringify({ error: message }));
+}
+
+function forwardProviderRequest({ clientReq, clientRes, upstream, target, outboundBody, headers, clientGone }) {
+  return new Promise((resolve) => {
+    if (clientGone() || clientRes.destroyed || clientRes.writableEnded) {
+      resolve();
+      return;
+    }
+
+    const requestId = ++providerRequestSeq;
+    const streamId = `chatcmpl-agent-proxy-${requestId}`;
+    const transport = upstream.protocol === "https:" ? https : http;
+    const streamingChat =
+      providerPreemptiveStream &&
+      clientReq.method === "POST" &&
+      isChatCompletionPath(target.pathname) &&
+      bodyRequestsStream(outboundBody);
+    const requestPath = `${target.pathname}${target.search}`;
+    let upstreamDone = false;
+    let responseDone = false;
+    let settled = false;
+    let heartbeat;
+
+    const settle = () => {
+      if (settled) return;
+      settled = true;
+      if (heartbeat) clearInterval(heartbeat);
+      resolve();
+    };
+
+    const finishResponse = () => {
+      responseDone = true;
+      if (!clientRes.destroyed && !clientRes.writableEnded) clientRes.end();
+    };
+
+    if (streamingChat) {
+      clientRes.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "x-accel-buffering": "no",
+      });
+      clientRes.flushHeaders?.();
+      writeSseComment(clientRes, "provider connected");
+      writeSseKeepalive(clientRes, streamId);
+      if (providerHeartbeatMs > 0) {
+        heartbeat = setInterval(() => writeSseKeepalive(clientRes, streamId), providerHeartbeatMs);
+        heartbeat.unref?.();
+      }
+    }
+
+    providerLog(`#${requestId} -> ${clientReq.method} ${requestPath}${streamingChat ? " stream" : ""}`);
+    const upstreamReq = transport.request(
+      {
+        protocol: upstream.protocol,
+        hostname: upstream.hostname,
+        port: upstream.port || (upstream.protocol === "https:" ? 443 : 80),
+        method: clientReq.method,
+        path: requestPath,
+        headers,
+      },
+      (upstreamRes) => {
+        const statusCode = upstreamRes.statusCode || 502;
+        const ok = statusCode >= 200 && statusCode < 300;
+        const reasoningTee =
+          teeProviderReasoning && isChatCompletionPath(target.pathname)
+            ? createProviderReasoningTee()
+            : undefined;
+        const sseNormalizer = streamingChat
+          ? createSseNormalizer((text) => {
+              if (!clientGone() && !clientRes.destroyed && !clientRes.writableEnded) {
+                clientRes.write(text);
+              }
+            }, streamId)
+          : undefined;
+
+        if (!streamingChat) {
+          clientRes.writeHead(statusCode, upstreamRes.headers);
+        } else if (!ok) {
+          const chunks = [];
+          upstreamRes.on("data", (chunk) => chunks.push(chunk));
+          upstreamRes.on("end", () => {
+            upstreamDone = true;
+            const body = Buffer.concat(chunks).toString("utf8").trim();
+            sendProxyError(clientRes, new Error(`upstream ${statusCode}${body ? `: ${body}` : ""}`), statusCode);
+            responseDone = true;
+            settle();
+          });
+          upstreamRes.on("error", (error) => {
+            upstreamDone = true;
+            sendProxyError(clientRes, error);
+            responseDone = true;
+            settle();
+          });
+          return;
+        }
+
+        upstreamRes.on("data", (chunk) => {
+          reasoningTee?.feed(chunk);
+          if (sseNormalizer) {
+            sseNormalizer.feed(chunk);
+          } else if (!clientGone() && !clientRes.destroyed && !clientRes.writableEnded) {
+            clientRes.write(chunk);
+          }
+        });
+        upstreamRes.on("end", () => {
+          upstreamDone = true;
+          sseNormalizer?.finish();
+          reasoningTee?.finish();
+          finishResponse();
+          providerLog(`#${requestId} <- done`);
+          settle();
+        });
+        upstreamRes.on("error", (error) => {
+          upstreamDone = true;
+          sendProxyError(clientRes, error);
+          responseDone = true;
+          settle();
+        });
+      },
+    );
+
+    if (providerTimeoutMs > 0) {
+      upstreamReq.setTimeout(providerTimeoutMs, () => {
+        upstreamReq.destroy(new Error(`provider timeout after ${providerTimeoutMs}ms`));
+      });
+    }
+
+    upstreamReq.on("error", (error) => {
+      if (!upstreamDone && !clientGone() && !clientRes.destroyed && !clientRes.writableEnded) {
+        sendProxyError(clientRes, error);
+        responseDone = true;
+      }
+      settle();
+    });
+
+    clientRes.on("close", () => {
+      if (responseDone || upstreamDone) return;
+      providerLog(`#${requestId} client closed; abort upstream`);
+      upstreamReq.destroy(new Error("client disconnected"));
+    });
+
+    upstreamReq.end(outboundBody);
+  });
+}
+
 async function startProviderProxyIfNeeded() {
   if (providerType !== "openai") return;
-  if (!injectSamplingParams && parallelToolCalls && !nativeThinkingEnabled && !teeProviderReasoning) return;
+  if (
+    !injectSamplingParams &&
+    parallelToolCalls &&
+    !nativeThinkingEnabled &&
+    !teeProviderReasoning &&
+    !providerSingleFlight &&
+    !providerPreemptiveStream
+  ) return;
 
   const upstream = new URL(baseUrl);
   const server = http.createServer((clientReq, clientRes) => {
+    let clientClosed = false;
+    clientRes.on("close", () => {
+      clientClosed = true;
+    });
+
     const bodyParts = [];
     clientReq.on("data", (chunk) => bodyParts.push(chunk));
+    clientReq.on("error", (error) => sendProxyError(clientRes, error));
     clientReq.on("end", () => {
       const body = Buffer.concat(bodyParts);
       const target = new URL(clientReq.url || "/", upstream);
@@ -144,40 +451,22 @@ async function startProviderProxyIfNeeded() {
       headers.host = upstream.host;
       headers["content-length"] = String(outboundBody.length);
 
-      const transport = upstream.protocol === "https:" ? https : http;
-      const upstreamReq = transport.request(
-        {
-          protocol: upstream.protocol,
-          hostname: upstream.hostname,
-          port: upstream.port || (upstream.protocol === "https:" ? 443 : 80),
-          method: clientReq.method,
-          path: `${target.pathname}${target.search}`,
-          headers,
-        },
-        (upstreamRes) => {
-          clientRes.writeHead(upstreamRes.statusCode || 502, upstreamRes.headers);
-          const reasoningTee =
-            teeProviderReasoning && target.pathname.endsWith("/chat/completions")
-              ? createProviderReasoningTee()
-              : undefined;
-
-          upstreamRes.on("data", (chunk) => {
-            reasoningTee?.feed(chunk);
-            clientRes.write(chunk);
-          });
-          upstreamRes.on("end", () => {
-            reasoningTee?.finish();
-            clientRes.end();
-          });
-        },
-      );
-
-      upstreamReq.on("error", (error) => {
-        clientRes.writeHead(502, { "content-type": "application/json" });
-        clientRes.end(JSON.stringify({ error: error.message }));
+      const run = () => forwardProviderRequest({
+        clientReq,
+        clientRes,
+        upstream,
+        target,
+        outboundBody,
+        headers,
+        clientGone: () => clientClosed || clientRes.destroyed || clientRes.writableEnded,
       });
 
-      upstreamReq.end(outboundBody);
+      const promise =
+        providerSingleFlight && isChatCompletionPath(target.pathname)
+          ? runProviderSingleFlight(run)
+          : run();
+
+      promise.catch((error) => sendProxyError(clientRes, error));
     });
   });
 
@@ -967,6 +1256,7 @@ const client = new CopilotClient({
   mode: "empty",
   workingDirectory: cwd,
   baseDirectory: path.join(cwd, ".copilot"),
+  logLevel: process.env.AGENT_SDK_LOG_LEVEL || process.env.COPILOT_LOG_LEVEL,
 });
 
 let failed = false;
